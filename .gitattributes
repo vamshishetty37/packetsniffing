@@ -1,0 +1,29 @@
+# One line ending everywhere: NSE scripts are also edited on Windows,
+# and CRLF must not leak into the repository.
+* text=auto eol=lf
+
+# GitHub does not know the .nse extension; without this hint the repository
+# shows up as "no language" and gets no syntax highlighting.
+*.nse  text eol=lf linguist-language=Lua
+*.lua  text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+*.md   text eol=lf
+*.py   text eol=lf
+*.sh   text eol=lf
+
+# This fixture exists to carry CRLF into the path reader; normalising it
+# would disarm the test that proves a Windows-written file still works.
+tests/fixtures/paths_crlf.txt -text
+
+# Test and CI infrastructure is not part of the release tarball users download,
+# and neither is the README's demonstration: docs/demo.gif is 695 KB against a
+# 260 KB archive, and it exists to be rendered on GitHub rather than unpacked.
+/.github         export-ignore
+/docs            export-ignore
+/tests           export-ignore
+/tools           export-ignore
+/.gitattributes  export-ignore
+/.gitignore      export-ignore
+/.editorconfig   export-ignore
+/CONTRIBUTING.md export-ignore

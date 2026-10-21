@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  push:
+    # catalog.yml publishes to the world from BOTH of these, and publishing is
+    # the whole distribution mechanism. A branch that can publish must be a
+    # branch that is gated, or the gate is decoration.
+    branches: [master, "2.0"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded push has nothing left to prove; the newer one gates the tree.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: Repository hygiene
+    runs-on: ubuntu-latest
+    # checks 54 files; seconds of work, and up to 14 minutes of apt retry
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # luac is what makes the global-reach check run rather than skip, and that
+      # check is the barrier against a local read above its own declaration -
+      # which Lua compiles happily into a global read, NSE turns into an error,
+      # and nmap answers by discarding every finding the port had.
+      # The version call is not decoration: check.py SKIPS the global check when
+      # it finds no luac, and a barrier that skips in CI is not a barrier. This
+      # step fails instead.
+      - name: Install the Lua compiler
+        uses: ./.github/actions/apt
+        with:
+          packages: lua5.4
+
+      - name: The Lua compiler is really there
+        run: luac5.4 -v
+
+      - name: Check for secrets, AI artifacts and clutter
+        run: python3 tools/check.py
+
+      # The dictionaries are downloaded at scan time, so a catalogue that is
+      # published broken breaks every scan everywhere until it is fixed - there
+      # is no release to hold it back.
+      #
+      # This validates the SHAPE. It deliberately does NOT decide whether a
+      # pattern is one the script will keep: that decision lives in
+      # usable_pattern, and a second copy of it could only drift. The unit
+      # suite drives the real reader instead, which is why it runs here too.
+      - name: The catalogue is publishable
+        run: python3 tools/catalog.py --check
+
+      - name: The XML contract still catches a broken report
+        run: python3 tools/xml_contract.py --selftest tests/fixtures/golden_1x.xml
+
+      # The catalogue rebuilds itself on a schedule and publishes without a
+      # human, so the tools that decide what ships are held to the same standard
+      # as the script: the translator that writes the rules, and the gate that
+      # decides a rebuild is safe to publish.
+      - name: The importer makes the decisions it is supposed to
+        run: |
+          # lua5.4 is already installed above, in this same job on this same
+          # runner; only the unsuffixed name the translator's oracle invokes
+          # is missing.
+          sudo ln -sf "$(command -v lua5.4)" /usr/local/bin/lua
+          python3 tools/fingerprints/selftest.py
+
+      - name: The publish gate refuses what it must
+        run: python3 tools/catalog_diff.py --selftest
+
+      # vulners.nse is a script FOR nmap, so it is held to what nmap asks of
+      # one: HACKING points at secwiki.org/w/Nmap/Code_Standards, and that page
+      # is what tools/nmap_style.py enforces. pycodestyle is installed rather
+      # than assumed, because the gate SKIPS the PEP 8 half when it is missing
+      # and a barrier that skips in CI is not a barrier.
+      - name: Nmap's own code standards
+        run: |
+          python3 -m pip install --quiet pycodestyle
+          python3 -m pycodestyle --version
+          python3 tools/nmap_style.py
+
+  tests:
+    name: NSE test suite
+    runs-on: ubuntu-latest
+    # the unit gate is under a second and the e2e about seven; the rest is
+    # apt, which may retry once at seven minutes a go
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nmap
+        uses: ./.github/actions/apt
+        with:
+          packages: nmap
+
+      - name: nmap is really there
+        run: nmap --version
+
+      # The suite runs inside nmap so the scripts are exercised against the
+      # real NSE libraries of the nmap version this job installed.
+      # nmap exits 0 when a script raises, so the status alone would report
+      # success for a suite that never ran a case. The output has to say it did.
+      # A key in the environment must not change the result: the suite fakes
+      # os.getenv, and this is what proves it keeps doing so.
+      - name: Unit tests
+        env:
+          VULNERS_API_KEY: not-a-real-key-the-suite-must-ignore-this
+        run: |
+          set -o pipefail
+          nmap -sn -Pn --script ./tests/run.nse \
+            --script-args testdir=tests,root=. 127.0.0.1 | tee unit.log
+          grep -q "SUITE OK" unit.log
+
+      - name: End-to-end tests
+        run: python3 tests/e2e/run_e2e.py
+
+  install:
+    name: Installer on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # measured: 10s on macOS, 1m03 on Windows, 5m34 on ubuntu on a bad day
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nmap (Linux)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/apt
+        with:
+          packages: nmap
+
+      - name: Install nmap (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nmap
+
+      - name: Install nmap (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nmap -y --no-progress
+
+      # The point of the check is not that the files were copied, but that nmap
+      # resolves the name to the copy just installed: nmap ships a vulners.nse
+      # of its own, and the installer is expected to replace it.
+      - name: Install and verify (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          ./install.sh --no-key
+          resolved=$(nmap -d2 --script-help vulners |
+                     sed -n 's|^Fetchfile found \(.*/scripts/vulners\.nse\)$|\1|p' | head -n 1)
+          echo "nmap resolves vulners to: $resolved"
+          grep -q 'api_version = "' "$resolved"
+          diff -q vulners.nse "$resolved"
+          nmap -sn -Pn --script vulners 127.0.0.1 >/dev/null
+
+      - name: Install and verify (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH += ";C:\Program Files (x86)\Nmap"
+          .\install.ps1 -NoKey
+          $resolved = $null
+          foreach ($line in (nmap -d2 --script-help vulners 2>&1)) {
+            if ("$line" -match '^Fetchfile found (.*vulners\.nse)$') { $resolved = $Matches[1]; break }
+          }
+          Write-Host "nmap resolves vulners to: $resolved"
+          if (-not $resolved) { throw "vulners.nse was not resolved" }
+          if ((Get-FileHash $resolved).Hash -ne (Get-FileHash vulners.nse).Hash) {
+            throw "nmap resolved a different copy than the one installed"
+          }
+          nmap -sn -Pn --script vulners 127.0.0.1 | Out-Null
+
+      # Checking --script-help here would prove nothing: nmap ships a
+      # vulners.nse of its own and prints an entry for it either way. What
+      # uninstall promises is that its five files are gone.
+      - name: Uninstall again (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # The probe name does not exist on purpose, so nmap exits non-zero
+          # after printing what it opened; that must not end the step.
+          datadir=$(nmap -d2 --script-help nmap-vulners-probe 2>&1 |
+                    sed -n 's|^Fetchfile found \(.*\)/nse_main\.lua$|\1|p' | head -n 1 || true)
+          ./install.sh --uninstall
+          for file in scripts/vulners.nse scripts/vulners_enterprise.nse \
+                      scripts/http-vulners-regex.nse \
+                      nselib/data/http-vulners-regex.json \
+                      nselib/data/http-vulners-paths.txt; do
+            if [ -e "$datadir/$file" ]; then
+              echo "$file survived the uninstall"
+              exit 1
+            fi
+          done
+          echo "all five files removed from $datadir"
+
+      - name: Uninstall again (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH += ";C:\Program Files (x86)\Nmap"
+          $datadir = $null
+          foreach ($line in (nmap -d2 --script-help nmap-vulners-probe 2>&1)) {
+            if ("$line" -match '^Fetchfile found (.*)[\\/]nse_main\.lua$') { $datadir = $Matches[1]; break }
+          }
+          .\install.ps1 -Uninstall
+          foreach ($file in @("scripts\vulners.nse", "scripts\vulners_enterprise.nse",
+                              "scripts\http-vulners-regex.nse",
+                              "nselib\data\http-vulners-regex.json",
+                              "nselib\data\http-vulners-paths.txt")) {
+            if (Test-Path (Join-Path $datadir $file)) { throw "$file survived the uninstall" }
+          }
+          Write-Host "all five files removed from $datadir"
